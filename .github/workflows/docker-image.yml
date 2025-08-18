@@ -72,6 +72,8 @@ jobs:
           file: ./docker/Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PROXY_ADDR=${{ secrets.PROXY_ADDR }}
           outputs: type=image,name=ghcr.io/${{ steps.lowercase.outputs.owner }}/aistudio-proxy-api,push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
 
       - name: Export digest
