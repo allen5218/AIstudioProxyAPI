@@ -20,6 +20,7 @@ from config import (
     MODEL_NAME,
     SUBMIT_BUTTON_SELECTOR,
 )
+from config import ONLY_COLLECT_CURRENT_USER_ATTACHMENTS, UPLOAD_FILES_DIR
 
 # --- models模块导入 ---
 from models import ChatCompletionRequest, ClientDisconnectedError
@@ -53,6 +54,14 @@ from .client_connection import (
 from .context_init import initialize_request_context as _init_request_context
 
 _initialize_request_context = _init_request_context
+
+# Error helpers
+from .error_utils import (
+    bad_request,
+    client_disconnected,
+    upstream_error,
+    server_error,
+)
 
 
 async def _analyze_model_requirements(req_id: str, context: RequestContext, request: ChatCompletionRequest) -> RequestContext:
@@ -109,11 +118,18 @@ async def _prepare_and_validate_request(
     try:
         validate_chat_request(request.messages, req_id)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"[{req_id}] 无效请求: {e}")
+        raise bad_request(req_id, f"无效请求: {e}")
     
-    prepared_prompt, images_list = prepare_combined_prompt(request.messages, req_id)
-    # 基于 tools/tool_choice 的主动函数执行
-    tool_exec_results = maybe_execute_tools(request.messages, request.tools, getattr(request, 'tool_choice', None))
+    prepared_prompt, images_list = prepare_combined_prompt(request.messages, req_id, getattr(request, 'tools', None), getattr(request, 'tool_choice', None))
+    # 基于 tools/tool_choice 的主动函数执行（支持 per-request MCP 端点）
+    try:
+        # 将 mcp_endpoint 注入 utils.maybe_execute_tools 的注册逻辑
+        if hasattr(request, 'mcp_endpoint') and request.mcp_endpoint:
+            from .tools_registry import register_runtime_tools
+            register_runtime_tools(getattr(request, 'tools', None), request.mcp_endpoint)
+        tool_exec_results = await maybe_execute_tools(request.messages, request.tools, getattr(request, 'tool_choice', None))
+    except Exception:
+        tool_exec_results = None
     check_client_disconnected("After Prompt Prep")
     # 将结果内联到提示末尾，供网页端一并提交
     if tool_exec_results:
@@ -125,6 +141,50 @@ async def _prepare_and_validate_request(
                 prepared_prompt += f"\n---\n工具执行: {name}\n参数:\n{args}\n结果:\n{result_str}\n"
         except Exception:
             pass
+    # 若配置仅收集当前用户消息附件，则在此过滤附件
+    try:
+        if ONLY_COLLECT_CURRENT_USER_ATTACHMENTS:
+            latest_user = None
+            for msg in reversed(request.messages or []):
+                if getattr(msg, 'role', None) == 'user':
+                    latest_user = msg
+                    break
+            if latest_user is not None:
+                filtered: List[str] = []
+                from api_utils.utils import extract_data_url_to_local
+                from urllib.parse import urlparse, unquote
+                import os
+                # 收集该条 user 消息上的 data:/file:/绝对路径（存在的）
+                content = getattr(latest_user, 'content', None)
+                # 统一从 messages 附件字段抽取
+                for key in ('attachments', 'images', 'files', 'media'):
+                    arr = getattr(latest_user, key, None)
+                    if not isinstance(arr, list):
+                        continue
+                    for it in arr:
+                        url_value = None
+                        if isinstance(it, str):
+                            url_value = it
+                        elif isinstance(it, dict):
+                            url_value = it.get('url') or it.get('path')
+                        url_value = (url_value or '').strip()
+                        if not url_value:
+                            continue
+                        if url_value.startswith('data:'):
+                            fp = extract_data_url_to_local(url_value)
+                            if fp:
+                                filtered.append(fp)
+                        elif url_value.startswith('file:'):
+                            parsed = urlparse(url_value)
+                            lp = unquote(parsed.path)
+                            if os.path.exists(lp):
+                                filtered.append(lp)
+                        elif os.path.isabs(url_value) and os.path.exists(url_value):
+                            filtered.append(url_value)
+                images_list = filtered
+    except Exception:
+        pass
+
     return prepared_prompt, images_list
 
 async def _handle_response_processing(
@@ -143,7 +203,8 @@ async def _handle_response_processing(
     current_ai_studio_model_id = context.get('current_ai_studio_model_id')
     
     # 检查是否使用辅助流
-    stream_port = os.environ.get('STREAM_PORT')
+    from config import get_environment_variable
+    stream_port = get_environment_variable('STREAM_PORT')
     use_stream = stream_port != '0'
     
     if use_stream:
@@ -352,6 +413,8 @@ async def _cleanup_request_resources(req_id: str, disconnect_check_task: Optiona
                                    is_streaming: bool) -> None:
     """清理请求资源"""
     from server import logger
+    from config import UPLOAD_FILES_DIR
+    import os, shutil
     
     if disconnect_check_task and not disconnect_check_task.done():
         disconnect_check_task.cancel()
@@ -363,6 +426,15 @@ async def _cleanup_request_resources(req_id: str, disconnect_check_task: Optiona
             logger.error(f"[{req_id}] 清理任务时出错: {task_clean_err}")
     
     logger.info(f"[{req_id}] 处理完成。")
+
+    # 清理本次请求的上传子目录，避免磁盘累积
+    try:
+        req_dir = os.path.join(UPLOAD_FILES_DIR, req_id)
+        if os.path.isdir(req_dir):
+            shutil.rmtree(req_dir, ignore_errors=True)
+            logger.info(f"[{req_id}] 已清理请求上传目录: {req_dir}")
+    except Exception as clean_err:
+        logger.warning(f"[{req_id}] 清理上传目录失败: {clean_err}")
     
     if is_streaming and completion_event and not completion_event.is_set() and (result_future.done() and result_future.exception() is not None):
          logger.warning(f"[{req_id}] 流式请求异常，确保完成事件已设置。")
@@ -406,13 +478,28 @@ async def _process_request_refactored(
         await _handle_parameter_cache(req_id, context)
         
         prepared_prompt,image_list = await _prepare_and_validate_request(req_id, request, check_client_disconnected)
-        # 兼容: 顶层与消息级附件字段合并到上传列表（仅 data:/file:/绝对路径）
+        # 额外合并顶层与消息级 attachments/files（兼容历史记录）已在下方处理；此处确保路径存在
         try:
+            import os
+            valid_images = []
+            for p in image_list:
+                if isinstance(p, str) and p and os.path.isabs(p) and os.path.exists(p):
+                    valid_images.append(p)
+            if len(valid_images) != len(image_list):
+                from server import logger
+                logger.warning(f"[{req_id}] 过滤掉不存在的附件路径: {set(image_list) - set(valid_images)}")
+            image_list = valid_images
+        except Exception:
+            pass
+        # 兼容: 顶层与消息级附件字段合并到上传列表（仅 data:/file:/绝对路径）
+        # 附件来源策略：仅接受当前请求显式提供的 data:/file:/绝对路径（存在的）
+        try:
+            from api_utils.utils import extract_data_url_to_local
+            from urllib.parse import urlparse, unquote
+            import os
+            # 顶层 attachments
             top_level_atts = getattr(request, 'attachments', None)
             if isinstance(top_level_atts, list) and len(top_level_atts) > 0:
-                from api_utils.utils import extract_data_url_to_local
-                from urllib.parse import urlparse, unquote
-                import os
                 for it in top_level_atts:
                     url_value = None
                     if isinstance(it, str):
@@ -423,7 +510,7 @@ async def _process_request_refactored(
                     if not url_value:
                         continue
                     if url_value.startswith('data:'):
-                        fp = extract_data_url_to_local(url_value)
+                        fp = extract_data_url_to_local(url_value, req_id=req_id)
                         if fp:
                             image_list.append(fp)
                     elif url_value.startswith('file:'):
@@ -433,7 +520,7 @@ async def _process_request_refactored(
                             image_list.append(lp)
                     elif os.path.isabs(url_value) and os.path.exists(url_value):
                         image_list.append(url_value)
-            # 消息级 attachments/images/files/media
+            # 消息级 attachments/images/files/media（全量收集，但仅保留有效本地/data）
             for msg in (request.messages or []):
                 for key in ('attachments', 'images', 'files', 'media'):
                     arr = getattr(msg, key, None)
@@ -449,7 +536,7 @@ async def _process_request_refactored(
                         if not url_value:
                             continue
                         if url_value.startswith('data:'):
-                            fp = extract_data_url_to_local(url_value)
+                            fp = extract_data_url_to_local(url_value, req_id=req_id)
                             if fp:
                                 image_list.append(fp)
                         elif url_value.startswith('file:'):
@@ -492,7 +579,7 @@ async def _process_request_refactored(
     except ClientDisconnectedError as disco_err:
         context['logger'].info(f"[{req_id}] 捕获到客户端断开连接信号: {disco_err}")
         if not result_future.done():
-             result_future.set_exception(HTTPException(status_code=499, detail=f"[{req_id}] Client disconnected during processing."))
+             result_future.set_exception(client_disconnected(req_id, "Client disconnected during processing."))
     except HTTPException as http_err:
         context['logger'].warning(f"[{req_id}] 捕获到 HTTP 异常: {http_err.status_code} - {http_err.detail}")
         if not result_future.done():
@@ -501,11 +588,11 @@ async def _process_request_refactored(
         context['logger'].error(f"[{req_id}] 捕获到 Playwright 错误: {pw_err}")
         await save_error_snapshot(f"process_playwright_error_{req_id}")
         if not result_future.done():
-            result_future.set_exception(HTTPException(status_code=502, detail=f"[{req_id}] Playwright interaction failed: {pw_err}"))
+            result_future.set_exception(upstream_error(req_id, f"Playwright interaction failed: {pw_err}"))
     except Exception as e:
         context['logger'].exception(f"[{req_id}] 捕获到意外错误")
         await save_error_snapshot(f"process_unexpected_error_{req_id}")
         if not result_future.done():
-            result_future.set_exception(HTTPException(status_code=500, detail=f"[{req_id}] Unexpected server error: {e}"))
+            result_future.set_exception(server_error(req_id, f"Unexpected server error: {e}"))
     finally:
         await _cleanup_request_resources(req_id, disconnect_check_task, completion_event, result_future, request.stream)
