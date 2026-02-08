@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional, Set, Union, cast
 
 from playwright.async_api import expect as expect_async
 
-from browser_utils.operations_modules.errors import save_error_snapshot
 from config import (
     CLICK_TIMEOUT_MS,
     DEFAULT_MAX_OUTPUT_TOKENS,

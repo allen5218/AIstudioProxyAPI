@@ -1,8 +1,6 @@
 import asyncio
-from typing import Optional
 
-from playwright.async_api import Locator
-from playwright.async_api import TimeoutError
+from playwright.async_api import Locator, TimeoutError
 from playwright.async_api import expect as expect_async
 
 from browser_utils.initialization import enable_temporary_chat_mode
