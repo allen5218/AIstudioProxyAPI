@@ -6,6 +6,7 @@
     ".git",
     ".venv",
     "node_modules",
+    "static/frontend/node_modules",
     "deprecated_javascript_version",
     "errors_py",
     "logs",
