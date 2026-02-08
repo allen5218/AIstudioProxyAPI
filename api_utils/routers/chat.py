@@ -3,7 +3,7 @@ import logging
 import random
 import time
 from asyncio import Future, Queue, Task
-from typing import Any, Union
+from typing import Union
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
